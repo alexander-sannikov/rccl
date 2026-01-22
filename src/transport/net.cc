@@ -26,6 +26,8 @@
 #include "npkit/npkit.h"
 #endif
 #include "msccl/msccl_lifecycle.h"
+#include <stdio.h>
+#include <glob.h>
 
 static_assert(sizeof(ncclNetHandle_t) <= CONNECT_SIZE, "NET Connect info is too large");
 
@@ -197,7 +199,34 @@ struct setupReq {
 };
 
 NCCL_PARAM(NetOptionalRecvCompletion, "NET_OPTIONAL_RECV_COMPLETION", 1);
-RCCL_PARAM(AinicRoce, "AINIC_ROCE", 0);
+#define MAX_VENDOR_LEN 16
+static int64_t rcclDetectAinic() {
+  const char* expVendorId = "0x1dd8";
+  char vendor[MAX_VENDOR_LEN];
+  int nAINICs = 0;
+  glob_t globResult;
+  if (glob("/sys/class/infiniband/*/device/vendor", GLOB_NOSORT, NULL, &globResult) != 0) {
+    return 0LL;
+  }
+
+  for (size_t i = 0; i < globResult.gl_pathc; i++) {
+    FILE* fp = fopen(globResult.gl_pathv[i], "r");
+    if (fp == NULL) continue;
+    if (fscanf(fp, "%s", vendor) == 1 && strcmp(vendor, expVendorId) == 0) {
+      nAINICs++;
+    }
+    fclose(fp);
+  }
+  globfree(&globResult);
+  if (nAINICs > 0) {
+    INFO(NCCL_INIT|NCCL_NET, "AINIC detection: Detected %d AINICs out of %d total IB devices. net_ib_rocm: enabled", nAINICs, globResult.gl_pathc);
+    return 1LL;
+  }
+  return 0LL;
+}
+
+RCCL_PARAM_AUTO(AinicRoce, "AINIC_ROCE", rcclDetectAinic);
+
 
 static_assert(sizeof(ncclNetHandle_t) + sizeof(int) <= CONNECT_SIZE, "Not large enough ncclConnect to hold ncclNetHandle_t and useGdr flag");
 

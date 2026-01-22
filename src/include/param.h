@@ -43,4 +43,15 @@ int64_t rcclParam##name() { \
     return cache; \
   }
 
+#define RCCL_PARAM_AUTO(name, env, deftValCb) \
+pthread_mutex_t rcclParamMutex##name = PTHREAD_MUTEX_INITIALIZER; \
+int64_t rcclParam##name() { \
+    constexpr int64_t uninitialized = INT64_MIN; \
+    static int64_t cache = uninitialized; \
+    if (__builtin_expect(__atomic_load_n(&cache, __ATOMIC_RELAXED) == uninitialized, false)) { \
+      int64_t deftVal = deftValCb(); \
+      ncclLoadParam("RCCL_" env, deftVal, uninitialized, &cache); \
+    } \
+    return cache; \
+  }
 #endif
