@@ -108,11 +108,10 @@ struct ncclIbMergedDev rocmIbMergedDevs[MAX_IB_VDEVS];
 struct ncclIbDev rocmIbDevs[MAX_IB_DEVS];
 pthread_mutex_t rocmIbLock = PTHREAD_MUTEX_INITIALIZER;
 static int ncclIbRelaxedOrderingEnabled = 0;
-static bool rcclAinicRoce = 0;
 static bool rcclCtsInlineData = 0;
 static bool rcclCtsOffloadEnabled = 0;
-static bool ncclIbUseInline = 0;
-static int ncclIbGdrFlushDisable = 0;
+constexpr bool ncclIbUseInline = true;
+constexpr int ncclIbGdrFlushDisable = 1;
 
 enum ncclIbChannelType {
   ncclIbChannelTypeCts  = 0,
@@ -653,6 +652,11 @@ ncclResult_t rocmIbMakeVDevice(int* d, ncclNetVDeviceProps_t* props) {
 
 static ncclProfilerCallback_t ncclProfilerFunction;
 
+template <bool USECTS_T>
+ncclResult_t rocmIbIsend(void* sendComm, void* data, size_t size, int tag, void* mhandle, void* phandle, void** request);
+template <bool USECTS_T>
+ncclResult_t rocmIbIrecv(void* recvComm, int n, void** data, size_t* sizes, int* tags, void** mhandles, void** phandles, void** request);
+
 ncclResult_t rocmIbInit(ncclDebugLogger_t logFunction, ncclProfilerCallback_t profFunction) {
   ncclResult_t ret = ncclSuccess;
   ncclProfilerFunction = profFunction;
@@ -817,22 +821,24 @@ ncclResult_t rocmIbInit(ncclDebugLogger_t logFunction, ncclProfilerCallback_t pr
     INFO(NCCL_INIT|NCCL_NET, "NET/IB : Using%s %s; OOB %s:%s", line, ncclIbRelaxedOrderingEnabled ? "[RO]" : "",
           ncclIbIfName, ncclSocketToString(&ncclIbIfAddr, addrline));
 
-    ncclIbUseInline = ncclParamRocmIbUseInline();
-    ncclIbGdrFlushDisable = ncclParamRocmIbGdrFlushDisable();
+    // for AINIC, these params are defaulted to enabled unless user forces it to disable(0).
+    rcclCtsInlineData = ((rcclParamCtsInlineData() == 0) ? false : true);
+    rcclCtsOffloadEnabled = ((rcclParamCtsOffloadEnabled() == 0) ? false : true);
+    if (rcclCtsInlineData != rcclCtsOffloadEnabled) {
+      WARN("NET/IB : CTS Inline Data and CTS Offload are mutually exclusive. Setting CTS InlineData to %s", rcclCtsOffloadEnabled ? "Enabled" : "Disabled");
+      rcclCtsInlineData = !rcclCtsOffloadEnabled;
+    }
 
-    rcclAinicRoce = ((rcclParamAinicRoce() == 1) ? true : false);
-    if (rcclAinicRoce) {
-      // for AINIC, these params are defaulted to enabled unless user forces it to disable(0).
-      rcclCtsInlineData = ((rcclParamCtsInlineData() == 0) ? false : true);
-      rcclCtsOffloadEnabled = ((rcclParamCtsOffloadEnabled() == 0) ? false : true);
-      // for AINIC IbUseInline is enabled by default always
-      ncclIbUseInline = true;
-      // for AINIC GDR flush is disabled by default
-      ncclIbGdrFlushDisable = 1;
-
-      INFO(NCCL_INIT|NCCL_NET, "NET/IB : AINIC RoCEv2 optimizations enabled: CTS Inline Data: %s; CTS Offload: %s; "
+    INFO(NCCL_INIT|NCCL_NET, "NET/IB : AINIC RoCEv2 optimizations enabled: CTS Inline Data: %s; CTS Offload: %s; "
            "IB Use Inline: enabled; GDR Flush: disabled", rcclCtsInlineData ? "Enabled": "Disabled",
            rcclCtsOffloadEnabled ? "Enabled": "Disabled");
+
+    if (rcclCtsOffloadEnabled) {
+      rocmNetIb.isend = rocmIbIsend<true>;
+      rocmNetIb.irecv = rocmIbIrecv<true>;
+    } else {
+      rocmNetIb.isend = rocmIbIsend<false>;
+      rocmNetIb.irecv = rocmIbIrecv<false>;
     }
 
     pthread_mutex_unlock(&rocmIbLock);
@@ -1236,8 +1242,10 @@ struct alignas(32) ncclIbNetCommBase {
 struct ncclIbSendComm {
   struct ncclIbNetCommBase base;
   // Start with fifo and ibv structs as they have alignment restrictions
-  struct ncclIbSendFifo fifo[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
-  struct ncclIbSendFifoCtsInline fifo_inline[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
+  union {
+    struct ncclIbSendFifo fifo[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
+    struct ncclIbSendFifoCtsInline fifo_inline[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
+  };
   struct ibv_sge sges[NCCL_NET_IB_MAX_RECVS];
   struct ibv_send_wr wrs[NCCL_NET_IB_MAX_RECVS + 1];
   // Each dev correlates to a mergedIbDev
@@ -1267,8 +1275,10 @@ struct ncclIbGpuFlush {
 };
 
 struct ncclIbRemFifo {
-  struct ncclIbSendFifo elems[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
-  struct ncclIbSendFifoCtsInline elems_cts_inline[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
+  union {
+    struct ncclIbSendFifo elems[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
+    struct ncclIbSendFifoCtsInline elems_cts_inline[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
+  };
   uint64_t fifoTail;
   uint64_t addr;
   uint32_t flags;
@@ -1344,7 +1354,7 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
   qpInitAttr.recv_cq = base->cq;
   qpInitAttr.qp_type = IBV_QPT_RC;
 
-  if (rcclAinicRoce) {
+
     if (!nccl_channel_ud_map[channel_id][channel_type].udAllocated) {
       bool lud = nccl_channel_last_ud[base->ibDevN][channel_type];
       nccl_channel_ud_map[channel_id][channel_type].udId = lud;
@@ -1370,7 +1380,7 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
     } else {
       qpInitAttr.sq_sig_all &= (~(1 << 19));
     }
-  }
+  
 
   // We might send 2 messages per send (RDMA and RDMA_WITH_IMM)
   qpInitAttr.cap.max_send_wr = 2*MAX_REQUESTS;
@@ -1383,9 +1393,8 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
     qpInitAttr.cap.max_inline_data = ncclIbUseInline ? sizeof(struct ncclIbSendFifo) : 0;
   }
   NCCLCHECK(wrap_ibv_create_qp(&qp->qp, base->pd, &qpInitAttr));
-  if (rcclAinicRoce) {
-    NCCLCHECK(wrap_ionicdv_qp_set_gda(qp->qp, false, true));
-  }
+  NCCLCHECK(wrap_ionicdv_qp_set_gda(qp->qp, false, true));
+
   struct ibv_qp_attr qpAttr;
   memset(&qpAttr, 0, sizeof(struct ibv_qp_attr));
   qpAttr.qp_state = IBV_QPS_INIT;
@@ -1395,9 +1404,8 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
   NCCLCHECK(wrap_ibv_modify_qp(qp->qp, &qpAttr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS));
   TRACE(NCCL_NET, "NET/IB : ncclIbCreateQp port=%d dev=%d devName=%s ndevs=%d nmdevs=%d qpn=%u pkey=%u pd=%p",
     ib_port, base->ibDevN, rocmIbDevs[base->ibDevN].devName, ncclNIbDevs, ncclNMergedIbDevs, qp->qp->qp_num, qpAttr.pkey_index, base->pd);
-  if (rcclAinicRoce) {
-    qp->ctsQpSlot = cts_qp_slot;
-  }
+  qp->ctsQpSlot = cts_qp_slot;
+
   return ncclSuccess;
 }
 
@@ -1492,9 +1500,8 @@ ncclResult_t rocmIbConnect(int dev, ncclNetCommConfig_t* config, void* opaqueHan
   int channel_id = 0;
   *sendComm = NULL;
 
-  if (rcclAinicRoce) {
-    channel_id = ((ncclNet_ctxt_t *)sendDevComm)->chId;
-  }
+  channel_id = ((ncclNet_ctxt_t *)sendDevComm)->chId;
+  
 
   if (stage->state == ncclIbCommStateConnect)      goto ib_connect_check;
   if (stage->state == ncclIbCommStateSendDevList)  goto ib_send_dev_list;
@@ -1808,9 +1815,8 @@ ncclResult_t rocmIbAccept(void* listenComm, void** recvComm, ncclNetDeviceHandle
   int channel_id = 0;
   *recvComm = NULL;
 
-  if (rcclAinicRoce) {
-    channel_id = ((ncclNet_ctxt_t *) recvDevComm)->chId;
-  }
+  channel_id = ((ncclNet_ctxt_t *) recvDevComm)->chId;
+
 
   if (stage->state == ncclIbCommStateAccept)   goto ib_accept_check;
   if (stage->state == ncclIbCommStateRecvDevList) goto ib_recv_dev_list;
@@ -2248,15 +2254,11 @@ ncclResult_t rocmIbDeregMr(void* comm, void* mhandle) {
 
 NCCL_PARAM(RocmIbSplitDataOnQps, "IB_SPLIT_DATA_ON_QPS", 0);
 
+template <bool USECTS_T>
 ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_write_op) {
   struct ncclIbRequest** reqs = comm->fifoReqs[slot];
   volatile struct ncclIbSendFifo* slots = comm->fifo[slot];
-  int nreqs;
-  if (rcclCtsOffloadEnabled) {
-    nreqs = 1;
-  } else {
-    nreqs = slots[0].nreqs;
-  }
+  int nreqs = USECTS_T ? 1 : slots[0].nreqs;
   if (nreqs > NCCL_NET_IB_MAX_RECVS) return ncclInternalError;
 
   uint64_t wr_id = 0ULL;
@@ -2268,7 +2270,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_wri
     sge->addr=(uintptr_t)reqs[r]->send.data;
     wr->opcode = IBV_WR_RDMA_WRITE;
     wr->send_flags = 0;
-    if (rcclCtsOffloadEnabled) {
+    if (USECTS_T) {
       wr->wr.rdma.remote_addr = 0xdeadbeef;
     } else {
       wr->wr.rdma.remote_addr = slots[r].addr;
@@ -2394,6 +2396,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_wri
   return ncclSuccess;
 }
 
+template <bool USECTS_T>
 ncclResult_t rocmIbIsend(void* sendComm, void* data, size_t size, int tag, void* mhandle, void* phandle, void** request) {
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
   if (comm->base.ready == 0) {
@@ -2405,21 +2408,21 @@ ncclResult_t rocmIbIsend(void* sendComm, void* data, size_t size, int tag, void*
 
   struct ncclIbMrHandle* mhandleWrapper = (struct ncclIbMrHandle*) mhandle;
   bool use_write_op = false;
-  if (rcclAinicRoce) {
-      use_write_op = (*request == (void *)NCCL_NET_OPTIONAL_RECV_COMPLETION) ? true : false;
-  }
+
+  use_write_op = (*request == (void *)NCCL_NET_OPTIONAL_RECV_COMPLETION) ? true : false;
+
 
   // Wait for the receiver to have posted the corresponding receive
   int nreqs = 0;
   volatile struct ncclIbSendFifo* slots;
 
-  if (rcclCtsOffloadEnabled) {
+  if (USECTS_T) {
       nreqs = 1;
   }
 
   int slot = (comm->fifoHead) % MAX_REQUESTS;
   struct ncclIbRequest** reqs = comm->fifoReqs[slot];
-  if (!rcclCtsOffloadEnabled) {
+  if (!USECTS_T) {
     slots = comm->fifo[slot];
     uint64_t idx = comm->fifoHead+1;
     if (slots[0].idx != idx) { *request = NULL; return ncclSuccess; }
@@ -2429,7 +2432,7 @@ ncclResult_t rocmIbIsend(void* sendComm, void* data, size_t size, int tag, void*
     __sync_synchronize(); // order the nreqsPtr load against tag/rkey/addr loads below
   }
   for (int r=0; r<nreqs; r++) {
-    if (!rcclCtsOffloadEnabled) {
+    if (!USECTS_T) {
       if (reqs[r] != NULL || slots[r].tag != tag) continue;
 
       if (size > slots[r].size) size = slots[r].size;
@@ -2487,10 +2490,10 @@ ncclResult_t rocmIbIsend(void* sendComm, void* data, size_t size, int tag, void*
     }
 
     TIME_START(0);
-    NCCLCHECK(ncclIbMultiSend(comm, slot, use_write_op));
+    NCCLCHECK(ncclIbMultiSend<USECTS_T>(comm, slot, use_write_op));
 
     // Clear slots[0]->nreqs, as well as other fields to help debugging and sanity checks
-    if (!rcclCtsOffloadEnabled) {
+    if (!USECTS_T) {
       memset((void*)slots, 0, sizeof(struct ncclIbSendFifo));
     }
     memset(reqs, 0, NCCL_NET_IB_MAX_RECVS*sizeof(struct ncclIbRequest*));
@@ -2503,6 +2506,10 @@ ncclResult_t rocmIbIsend(void* sendComm, void* data, size_t size, int tag, void*
   return ncclSuccess;
 }
 
+template ncclResult_t rocmIbIsend<false>(void*, void*, size_t, int, void*, void*, void**);
+template ncclResult_t rocmIbIsend<true>(void*, void*, size_t, int, void*, void*, void**);
+
+template <bool USECTS_T>
 ncclResult_t rocmIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, size_t* sizes, int* tags, void** mhandles, struct ncclIbRequest* req) {
   struct ibv_send_wr wr;
   struct ncclIbSendFifo* localElem = NULL;
@@ -2515,25 +2522,18 @@ ncclResult_t rocmIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, siz
   int slot = comm->remFifo.fifoTail%MAX_REQUESTS;
   req->recv.sizes = comm->sizesFifo[slot];
   for (int i=0; i<n; i++) req->recv.sizes[i] = 0;
-  if (rcclCtsInlineData) {
+  if (USECTS_T) {
     localElemCtsInline = comm->remFifo.elems_cts_inline[slot];
   } else {
     localElem = comm->remFifo.elems[slot];
   }
 
-  if (rcclAinicRoce) {
     qpIndex = comm->base.qpIndex;
     ctsQp = comm->base.qps + qpIndex;
-  } else {
-    // Select the next devIndex (local) and QP to use for posting this CTS message
-    // Since QPs are initialized by striping across devIndex, we can simply assign this to the same value
-    ctsQp = comm->base.qps + comm->base.devIndex;
-    comm->base.devIndex = (comm->base.devIndex + 1) % comm->base.vProps.ndevs;
-  }
 
   for (int i=0; i<n; i++) {
     struct ncclIbMrHandle* mhandleWrapper = (struct ncclIbMrHandle*) mhandles[i];
-    if (rcclCtsInlineData) {
+    if (USECTS_T) {
       localElemCtsInline[i].addr = (uint64_t)data[i];
 
       // Send all applicable rkeys
@@ -2567,7 +2567,7 @@ ncclResult_t rocmIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, siz
 
   // Set the correct sge properties
   comm->devs[ctsQp->devIndex].fifoSge.addr   = localElemRef;
-  if (rcclCtsInlineData) {
+  if (USECTS_T) {
     comm->devs[ctsQp->devIndex].fifoSge.length = MAX_INLINE_DATA_SIZE;
   } else {
     comm->devs[ctsQp->devIndex].fifoSge.length = n*sizeof(struct ncclIbSendFifo);
@@ -2601,17 +2601,12 @@ ncclResult_t rocmIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, siz
   //
   // slot == devIndex - When writing to fifo slot N, and this QP lives on device index N, it should send signalled.
   // This works out that each fifo posting QP gets drained
-  if (rcclAinicRoce) {
     if (slot == ctsQp->ctsQpSlot) {
       wr.send_flags |= IBV_SEND_SIGNALED;
       wr.wr_id = req - comm->base.reqs;
       ncclIbAddEvent(req, ctsQp->devIndex, &comm->devs[ctsQp->devIndex].base);
     }
-  } else if (slot == ctsQp->devIndex) {
-    wr.send_flags |= IBV_SEND_SIGNALED;
-    wr.wr_id = req - comm->base.reqs;
-    ncclIbAddEvent(req, ctsQp->devIndex, &comm->devs[ctsQp->devIndex].base);
-  }
+  
 
   struct ibv_send_wr* bad_wr;
   NCCLCHECK(wrap_ibv_post_send(ctsQp->qp, &wr, &bad_wr));
@@ -2622,13 +2617,12 @@ ncclResult_t rocmIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, siz
 
   comm->remFifo.fifoTail++;
 
-  if (rcclAinicRoce) {
-    // Select the next qpIndex
-    comm->base.qpIndex = (comm->base.qpIndex+1) % comm->base.nqps;
-  }
+  comm->base.qpIndex = (comm->base.qpIndex+1) % comm->base.nqps;
+  
   return ncclSuccess;
 }
 
+template <bool USECTS_T>
 ncclResult_t rocmIbIrecv(void* recvComm, int n, void** data, size_t* sizes, int* tags, void** mhandles, void** phandles, void** request) {
   ncclResult_t res = ncclSuccess;
   bool netOptRecvCompletionEnabled = false;
@@ -2641,10 +2635,8 @@ ncclResult_t rocmIbIrecv(void* recvComm, int n, void** data, size_t* sizes, int*
   if (n > NCCL_NET_IB_MAX_RECVS) return ncclInternalError;
   NCCLCHECK(ncclIbStatsCheckFatalCount(&comm->base.stats,__func__));
 
-  if (rcclAinicRoce) {
-    if (*request == (void *) NCCL_NET_OPTIONAL_RECV_COMPLETION) {
+  if (*request == (void *) NCCL_NET_OPTIONAL_RECV_COMPLETION) {
         netOptRecvCompletionEnabled = true;
-    }
   }
   struct ncclIbRequest* req;
   NCCLCHECK(rocmIbGetRequest(&comm->base, &req));
@@ -2695,11 +2687,8 @@ ncclResult_t rocmIbIrecv(void* recvComm, int n, void** data, size_t* sizes, int*
       NCCLCHECKGOTO(wrap_ibv_post_recv(qp->qp, &wr, &bad_wr), res, err);
       // Don't update comm->base.qpIndex yet, we need to run through this same set of QPs
       // inside rocmIbPostFifo()
-      if (rcclAinicRoce) {
-        qpIndex = (qpIndex+1)%comm->base.nqps;
-      } else {
-        comm->base.qpIndex = (comm->base.qpIndex+1)%comm->base.nqps;
-      }
+      qpIndex = (qpIndex+1)%comm->base.nqps;
+
     }
 
     TIME_STOP(1);
@@ -2707,7 +2696,7 @@ ncclResult_t rocmIbIrecv(void* recvComm, int n, void** data, size_t* sizes, int*
 
   // Post to FIFO to notify sender
   TIME_START(2);
-  NCCLCHECKGOTO(rocmIbPostFifo(comm, n, data, sizes, tags, mhandles, req), res, err);
+  NCCLCHECKGOTO(rocmIbPostFifo<USECTS_T>(comm, n, data, sizes, tags, mhandles, req), res, err);
   TIME_STOP(2);
 
   *request = req;
@@ -2718,6 +2707,8 @@ err:
   }
   return res;
 }
+template ncclResult_t rocmIbIrecv<false>(void*, int, void**, size_t*, int*, void**, void**, void**);
+template ncclResult_t rocmIbIrecv<true>(void*, int, void**, size_t*, int*, void**, void**, void**);
 
 ncclResult_t rocmIbIflush(void* recvComm, int n, void** data, int* sizes, void** mhandles, void** request) {
   struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)recvComm;
@@ -2822,9 +2813,8 @@ ncclResult_t rocmIbTest(void* request, int* done, int* sizes) {
     int wrDone = 0;
     struct ibv_wc wcs[NCCL_CQ_POLL_MAX_EVENT];
     int cqMaxPollEvent = 4;
-    if (rcclAinicRoce) {
-        cqMaxPollEvent = NCCL_CQ_POLL_MAX_EVENT;
-    }
+    cqMaxPollEvent = NCCL_CQ_POLL_MAX_EVENT;
+
 
     for (int i = 0; i < NCCL_IB_MAX_DEVS_PER_NIC; i++) {
       TIME_START(3);
@@ -2988,8 +2978,8 @@ ncclNet_t rocmNetIb = {
   rocmIbRegMr,
   rocmIbRegMrDmaBuf,
   rocmIbDeregMr,
-  rocmIbIsend,
-  rocmIbIrecv,
+  NULL /* rocmIbIsend */,
+  NULL /* rocmIbIrecv */,
   rocmIbIflush,
   rocmIbTest,
   rocmIbCloseSend,
